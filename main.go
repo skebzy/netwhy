@@ -97,7 +97,7 @@ const (
 
 const maxConcurrentTCPAttempts = 8
 
-// DurationMs wraps time.Duration so JSON marshaling outputs decimal milliseconds.
+// DurationMs marshals duration as float milliseconds in JSON.
 type DurationMs time.Duration
 
 func (d DurationMs) Duration() time.Duration {
@@ -393,6 +393,7 @@ type Options struct {
 	Target        string
 	IPv4Only      bool
 	IPv6Only      bool
+	NoHTTP        bool
 	Resolver      string
 	Method        string
 	Timeout       time.Duration
@@ -454,8 +455,6 @@ type WireResolver struct {
 	ResolverAddr string
 }
 
-// Redaction & terminal safety
-
 var sensitiveHeaders = map[string]bool{
 	"authorization":       true,
 	"proxy-authorization": true,
@@ -490,7 +489,7 @@ var sensitiveQueryParams = map[string]bool{
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)`)
 
-// RedactHeaders returns a copy of headers with sensitive values masked.
+// RedactHeaders masks authorization and cookie headers.
 func RedactHeaders(headers map[string]string) map[string]string {
 	if headers == nil {
 		return nil
@@ -507,7 +506,7 @@ func RedactHeaders(headers map[string]string) map[string]string {
 	return clean
 }
 
-// RedactURL masks sensitive query parameters and URL userinfo credentials.
+// RedactURL scrubs credentials and auth query parameters from a URL.
 func RedactURL(rawURL string) string {
 	if rawURL == "" {
 		return ""
@@ -549,7 +548,7 @@ func RedactURL(rawURL string) string {
 	return SanitizeTerminalOneLine(res)
 }
 
-// SanitizeTerminalOneLine strips ANSI escapes and replaces newlines/tabs with spaces to prevent line forging in table cells.
+// SanitizeTerminalOneLine strips ANSI escapes and collapses whitespace/newlines.
 func SanitizeTerminalOneLine(s string) string {
 	if s == "" {
 		return ""
@@ -567,7 +566,7 @@ func SanitizeTerminalOneLine(s string) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// SanitizeTerminal strips ANSI escapes and control codes while preserving newlines.
+// SanitizeTerminal strips ANSI escape sequences and control characters.
 func SanitizeTerminal(s string) string {
 	if s == "" {
 		return ""
@@ -582,8 +581,6 @@ func SanitizeTerminal(s string) string {
 	}
 	return sb.String()
 }
-
-// Target parsing
 
 func ParseTarget(raw string) (TargetInfo, error) {
 	trimmed := strings.TrimSpace(raw)
@@ -696,8 +693,6 @@ func ParseTarget(raw string) (TargetInfo, error) {
 	return info, nil
 }
 
-// DNS wire client
-
 func RCodeString(rcode int) string {
 	switch rcode {
 	case RCodeNoError:
@@ -727,7 +722,7 @@ func EncodeQuestion(name string, qtype uint16) ([]byte, uint16, error) {
 
 	buf := make([]byte, 12)
 	binary.BigEndian.PutUint16(buf[0:2], id)
-	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // RD = 1 (Recursion Desired)
+	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // RD = 1
 	binary.BigEndian.PutUint16(buf[4:6], 1)      // QDCount = 1
 
 	encodedName, err := EncodeDomainName(name)
@@ -768,8 +763,7 @@ func EncodeDomainName(domain string) ([]byte, error) {
 	return buf, nil
 }
 
-// DecodeDomainName parses a domain name from packet starting at offset. It tracks visited
-// pointer offsets to prevent compression loops and caps pointer jumps at 32.
+// DecodeDomainName parses RFC 1035 wire labels with loop detection and jump limits.
 func DecodeDomainName(packet []byte, startOffset int) (string, int, error) {
 	if startOffset < 0 || startOffset >= len(packet) {
 		return "", 0, ErrMalformedPacket
@@ -964,11 +958,18 @@ func ParseDNSMessage(packet []byte) (*Message, error) {
 	return msg, nil
 }
 
-// WireQuery sends a DNS query over UDP, falling back to 2-byte length-prefixed TCP if the TC bit is set.
-func WireQuery(ctx context.Context, resolverAddr, hostname string, qtype uint16) (*Message, time.Duration, error) {
-	if !strings.Contains(resolverAddr, ":") {
-		resolverAddr = net.JoinHostPort(resolverAddr, "53")
+// normalizeResolverAddr appends default port 53 if omitted.
+func normalizeResolverAddr(addr string) string {
+	trimmed := strings.TrimSpace(addr)
+	if _, _, err := net.SplitHostPort(trimmed); err == nil {
+		return trimmed
 	}
+	return net.JoinHostPort(trimmed, "53")
+}
+
+// WireQuery sends a DNS query over UDP, falling back to TCP on truncation (TC bit).
+func WireQuery(ctx context.Context, resolverAddr, hostname string, qtype uint16) (*Message, time.Duration, error) {
+	resolverAddr = normalizeResolverAddr(resolverAddr)
 
 	reqPacket, queryID, err := EncodeQuestion(hostname, qtype)
 	if err != nil {
@@ -1224,8 +1225,6 @@ func (w *WireResolver) Lookup(ctx context.Context, hostname string) (*DNSResult,
 	return result, nil
 }
 
-// Environment & proxy inspection
-
 func InspectEnvironment(targetURL *url.URL) EnvironmentInfo {
 	env := EnvironmentInfo{}
 
@@ -1254,8 +1253,6 @@ func InspectEnvironment(targetURL *url.URL) EnvironmentInfo {
 
 	return env
 }
-
-// TCP probing
 
 func ClassifyTCPError(err error) string {
 	if err == nil {
@@ -1329,7 +1326,6 @@ func ProbeTCP(ctx context.Context, ips []string, port int, dialTimeout time.Dura
 		rawAttempts = append(rawAttempts, attempt)
 	}
 
-	// Deterministic sorting of attempts: family (ipv4 first), IP, port.
 	sort.Slice(rawAttempts, func(i, j int) bool {
 		if rawAttempts[i].Family != rawAttempts[j].Family {
 			return rawAttempts[i].Family < rawAttempts[j].Family
@@ -1439,8 +1435,6 @@ func probeSingleTCP(ctx context.Context, ipStr string, port int, dialTimeout tim
 	return attempt
 }
 
-// TLS inspection
-
 func TLSVersionName(v uint16) string {
 	switch v {
 	case tls.VersionTLS10:
@@ -1456,8 +1450,7 @@ func TLSVersionName(v uint16) string {
 	}
 }
 
-// ProbeTLS connects to opts.ConnectHost at the socket layer while using opts.ServerName
-// for SNI and certificate verification.
+// ProbeTLS dials the target and inspects the TLS certificate chain and handshake.
 func ProbeTLS(ctx context.Context, opts TLSOptions) *TLSResult {
 	if opts.DialTimeout <= 0 {
 		opts.DialTimeout = 3 * time.Second
@@ -1477,8 +1470,7 @@ func ProbeTLS(ctx context.Context, opts TLSOptions) *TLSResult {
 		DialedAddress: addr,
 	}
 
-	// Complete handshake without automatic certificate rejection so the presented
-	// chain can still be captured from broken endpoints. Verification is performed below.
+	// InsecureSkipVerify allows capturing invalid or expired certs for inspection.
 	tlsConfig := &tls.Config{
 		ServerName:         opts.ServerName,
 		InsecureSkipVerify: true,
@@ -1621,8 +1613,6 @@ func ProbeTLS(ctx context.Context, opts TLSOptions) *TLSResult {
 	return result
 }
 
-// HTTP probing
-
 func ProbeHTTP(ctx context.Context, opts HTTPOptions) *HTTPResult {
 	if opts.Method == "" {
 		opts.Method = "HEAD"
@@ -1731,6 +1721,7 @@ func ProbeHTTP(ctx context.Context, opts HTTPOptions) *HTTPResult {
 
 	transport := &http.Transport{
 		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: opts.Timeout,
 		TLSHandshakeTimeout:   opts.DialTimeout,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1740,8 +1731,7 @@ func ProbeHTTP(ctx context.Context, opts HTTPOptions) *HTTPResult {
 			}
 
 			dialAddr := addr
-			// Pin socket destination only when dialing the original target host.
-			// Redirects to other hosts resolve normally through system DNS.
+			// Pin destination IP for target host only; redirects resolve via DNS.
 			if opts.CustomDNSIP != "" && !opts.UseProxy {
 				host, port, splitErr := net.SplitHostPort(addr)
 				if splitErr == nil && strings.EqualFold(host, targetHostToPin) {
@@ -1838,14 +1828,12 @@ func ProbeHTTP(ctx context.Context, opts HTTPOptions) *HTTPResult {
 	return result
 }
 
-// Explanation & reasoning
-
 func Explain(res *RunResult) []Finding {
 	findings, _, _ := ExplainWithReasoning(res)
 	return findings
 }
 
-// ExplainWithReasoning derives findings and per-layer explanations from a run result.
+// ExplainWithReasoning evaluates layer results and generates root cause findings.
 func ExplainWithReasoning(res *RunResult) ([]Finding, []LayerReasoning, string) {
 	if res == nil {
 		return nil, nil, ""
@@ -2054,6 +2042,28 @@ func ExplainWithReasoning(res *RunResult) ([]Finding, []LayerReasoning, string) 
 				"Hostname / SNI mismatch",
 				"Untrusted certificate authority",
 			}
+
+			if res.TLS.ExpiryValid {
+				now := time.Now()
+				if res.TLS.NotAfter.After(now) {
+					daysRemaining := int(res.TLS.NotAfter.Sub(now).Hours() / 24)
+					if daysRemaining <= 30 {
+						findings = append(findings, Finding{
+							Severity: SeverityWarning,
+							Title:    fmt.Sprintf("TLS Certificate Expiring Soon (%d days remaining)", daysRemaining),
+							Evidence: []string{
+								fmt.Sprintf("Expiration Date: %s", res.TLS.NotAfter.Format("2006-01-02 15:04:05 UTC")),
+								fmt.Sprintf("Days Remaining: %d", daysRemaining),
+								fmt.Sprintf("Subject: %s", res.TLS.LeafSubject),
+								fmt.Sprintf("Issuer: %s", res.TLS.LeafIssuer),
+							},
+							PossibleCauses: []string{
+								"Certificate renewal is required soon to prevent service interruption",
+							},
+						})
+					}
+				}
+			}
 		} else {
 			tlsReas.Summary = "TLS handshake completed, but certificate validation failed."
 			tlsReas.Why = strings.Join(res.TLS.ValidationErrors, "; ")
@@ -2160,6 +2170,23 @@ func ExplainWithReasoning(res *RunResult) ([]Finding, []LayerReasoning, string) 
 					"Server closed connection during request transmission",
 				},
 			})
+
+			nonStandardPort := res.Target.Port != 80 && res.Target.Port != 443 && res.Target.Port != 8080 && res.Target.Port != 8443
+			if nonStandardPort && (res.TCP != nil && res.TCP.AnySuccess) {
+				findings = append(findings, Finding{
+					Severity: SeverityInfo,
+					Title:    fmt.Sprintf("Potential Non-HTTP Service on Port %d", res.Target.Port),
+					Evidence: []string{
+						fmt.Sprintf("TCP connection succeeded on port %d", res.Target.Port),
+						fmt.Sprintf("HTTP request returned error: %s", res.HTTP.Error),
+					},
+					PossibleCauses: []string{
+						fmt.Sprintf("Port %d may be serving a non-HTTP protocol (e.g. database, SSH, RPC, raw TCP)", res.Target.Port),
+						"Use --no-http flag to test TCP and TLS connectivity without sending an HTTP request",
+					},
+				})
+			}
+
 			summaryParts = append(summaryParts, "Connection blocked at HTTP layer (transport failure).")
 		}
 		reasoning = append(reasoning, httpReas)
@@ -2325,9 +2352,7 @@ func ExplainMatrix(matrix *MatrixResult) (differences []string, primaryObs strin
 	return differences, primaryObs, findings
 }
 
-// Probing & matrix execution
-
-// Run probes the target through DNS, TCP, TLS, and HTTP as applicable.
+// Run executes the diagnostic pipeline against the target endpoint.
 func Run(ctx context.Context, opts Options) (*RunResult, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 10 * time.Second
@@ -2344,6 +2369,9 @@ func Run(ctx context.Context, opts Options) (*RunResult, error) {
 	targetInfo, err := ParseTarget(opts.Target)
 	if err != nil {
 		return nil, fmt.Errorf("target parse error: %w", err)
+	}
+	if opts.NoHTTP {
+		targetInfo.UseHTTP = false
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
@@ -2626,60 +2654,118 @@ func RunMatrix(ctx context.Context, opts MatrixOptions) (*MatrixResult, error) {
 		Target: targetInfo,
 	}
 
-	appRun, _ := Run(ctx, Options{
-		Target:      opts.Target,
-		BypassProxy: false,
-		Method:      opts.Method,
-		Timeout:     opts.Timeout,
-		DialTimeout: opts.DialTimeout,
-	})
-	if appRun != nil {
-		matrix.Environment = appRun.Environment
+	type pathTask struct {
+		index   int
+		name    string
+		desc    string
+		isApp   bool
+		runOpts Options
 	}
-	matrix.Paths = append(matrix.Paths, buildPathResult("Application path", "Uses system resolver and configured environment proxy", appRun, true))
 
-	directRun, _ := Run(ctx, Options{
-		Target:      opts.Target,
-		BypassProxy: true,
-		Method:      opts.Method,
-		Timeout:     opts.Timeout,
-		DialTimeout: opts.DialTimeout,
-	})
-	matrix.Paths = append(matrix.Paths, buildPathResult("Direct", "Direct connection with environment proxy bypassed", directRun, false))
-
-	ipv4Run, _ := Run(ctx, Options{
-		Target:        opts.Target,
-		BypassProxy:   true,
-		IPv4Only:      true,
-		ForcedNetwork: "tcp4",
-		Method:        opts.Method,
-		Timeout:       opts.Timeout,
-		DialTimeout:   opts.DialTimeout,
-	})
-	matrix.Paths = append(matrix.Paths, buildPathResult("IPv4 direct", "Direct connection restricted to IPv4", ipv4Run, false))
-
-	ipv6Run, _ := Run(ctx, Options{
-		Target:        opts.Target,
-		BypassProxy:   true,
-		IPv6Only:      true,
-		ForcedNetwork: "tcp6",
-		Method:        opts.Method,
-		Timeout:       opts.Timeout,
-		DialTimeout:   opts.DialTimeout,
-	})
-	matrix.Paths = append(matrix.Paths, buildPathResult("IPv6 direct", "Direct connection restricted to IPv6", ipv6Run, false))
+	tasks := []pathTask{
+		{
+			index: 0,
+			name:  "Application path",
+			desc:  "Uses system resolver and configured environment proxy",
+			isApp: true,
+			runOpts: Options{
+				Target:      opts.Target,
+				BypassProxy: false,
+				Method:      opts.Method,
+				Timeout:     opts.Timeout,
+				DialTimeout: opts.DialTimeout,
+			},
+		},
+		{
+			index: 1,
+			name:  "Direct",
+			desc:  "Direct connection with environment proxy bypassed",
+			isApp: false,
+			runOpts: Options{
+				Target:      opts.Target,
+				BypassProxy: true,
+				Method:      opts.Method,
+				Timeout:     opts.Timeout,
+				DialTimeout: opts.DialTimeout,
+			},
+		},
+		{
+			index: 2,
+			name:  "IPv4 direct",
+			desc:  "Direct connection restricted to IPv4",
+			isApp: false,
+			runOpts: Options{
+				Target:        opts.Target,
+				BypassProxy:   true,
+				IPv4Only:      true,
+				ForcedNetwork: "tcp4",
+				Method:        opts.Method,
+				Timeout:       opts.Timeout,
+				DialTimeout:   opts.DialTimeout,
+			},
+		},
+		{
+			index: 3,
+			name:  "IPv6 direct",
+			desc:  "Direct connection restricted to IPv6",
+			isApp: false,
+			runOpts: Options{
+				Target:        opts.Target,
+				BypassProxy:   true,
+				IPv6Only:      true,
+				ForcedNetwork: "tcp6",
+				Method:        opts.Method,
+				Timeout:       opts.Timeout,
+				DialTimeout:   opts.DialTimeout,
+			},
+		},
+	}
 
 	if opts.Resolver != "" {
-		resRun, _ := Run(ctx, Options{
-			Target:      opts.Target,
-			BypassProxy: true,
-			Resolver:    opts.Resolver,
-			Method:      opts.Method,
-			Timeout:     opts.Timeout,
-			DialTimeout: opts.DialTimeout,
+		tasks = append(tasks, pathTask{
+			index: 4,
+			name:  "Alternate resolver",
+			desc:  fmt.Sprintf("Direct connection via custom DNS resolver %s", opts.Resolver),
+			isApp: false,
+			runOpts: Options{
+				Target:      opts.Target,
+				BypassProxy: true,
+				Resolver:    opts.Resolver,
+				Method:      opts.Method,
+				Timeout:     opts.Timeout,
+				DialTimeout: opts.DialTimeout,
+			},
 		})
-		matrix.Paths = append(matrix.Paths, buildPathResult("Alternate resolver", fmt.Sprintf("Direct connection via custom DNS resolver %s", opts.Resolver), resRun, false))
 	}
+
+	results := make([]PathResult, len(tasks))
+	var appRunEnv *EnvironmentInfo
+	var envMu sync.Mutex
+
+	var wg sync.WaitGroup
+	for _, task := range tasks {
+		wg.Add(1)
+		go func(t pathTask) {
+			defer wg.Done()
+			runRes, _ := Run(ctx, t.runOpts)
+			if t.isApp && runRes != nil {
+				envMu.Lock()
+				env := runRes.Environment
+				appRunEnv = &env
+				envMu.Unlock()
+			}
+			results[t.index] = buildPathResult(t.name, t.desc, runRes, t.isApp)
+		}(task)
+	}
+	wg.Wait()
+
+	if appRunEnv != nil {
+		matrix.Environment = *appRunEnv
+	} else if len(results) > 0 && results[0].Run != nil {
+		matrix.Environment = results[0].Run.Environment
+	}
+
+	matrix.Paths = results
 
 	diffs, primaryObs, findings := ExplainMatrix(matrix)
 	matrix.ObservedDifferences = diffs
@@ -2756,8 +2842,6 @@ func buildPathResult(name, desc string, run *RunResult, isAppPath bool) PathResu
 	return res
 }
 
-// Snapshots and diffing
-
 func FromRunResult(run *RunResult) *Snapshot {
 	if run == nil {
 		return nil
@@ -2809,7 +2893,7 @@ func LoadSnapshotFile(path string) (*Snapshot, error) {
 	return &snap, nil
 }
 
-// decodeTextBytes strips UTF-8 BOM or converts UTF-16 LE/BE bytes to UTF-8.
+// decodeTextBytes handles UTF-8 BOM and UTF-16 encodings.
 func decodeTextBytes(data []byte) ([]byte, error) {
 	if bytes.HasPrefix(data, []byte("\xef\xbb\xbf")) {
 		return bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")), nil
@@ -3036,12 +3120,41 @@ func sortedUnique(slice []string) []string {
 	return out
 }
 
-// Formatting & output
-
 func PrintJSON(w io.Writer, data any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(data)
+}
+
+func isColorEnabled(w io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func colorizeBadge(badge string, color bool) string {
+	if !color {
+		return "[" + badge + "]"
+	}
+	switch badge {
+	case "FAIL":
+		return "[\x1b[31m" + badge + "\x1b[0m]"
+	case "WARN":
+		return "[\x1b[33m" + badge + "\x1b[0m]"
+	case "INFO":
+		return "[\x1b[36m" + badge + "\x1b[0m]"
+	default:
+		return "[" + badge + "]"
+	}
 }
 
 func PrintTerminalRun(w io.Writer, res *RunResult) {
@@ -3049,6 +3162,7 @@ func PrintTerminalRun(w io.Writer, res *RunResult) {
 		return
 	}
 
+	color := isColorEnabled(w)
 	fmt.Fprintf(w, "\nTarget: %s\n\n", SanitizeTerminalOneLine(res.Target.Original))
 
 	tw := tabwriter.NewWriter(w, 0, 8, 3, ' ', 0)
@@ -3168,7 +3282,7 @@ func PrintTerminalRun(w io.Writer, res *RunResult) {
 				badge = "WARN"
 			}
 
-			fmt.Fprintf(w, "  [%s] %s\n", badge, SanitizeTerminalOneLine(f.Title))
+			fmt.Fprintf(w, "  %s %s\n", colorizeBadge(badge, color), SanitizeTerminalOneLine(f.Title))
 			if len(f.Evidence) > 0 {
 				fmt.Fprintf(w, "    Observed:\n")
 				for _, e := range f.Evidence {
@@ -3202,6 +3316,7 @@ func PrintTerminalMatrix(w io.Writer, matrix *MatrixResult) {
 		return
 	}
 
+	color := isColorEnabled(w)
 	fmt.Fprintf(w, "\nTarget: %s\n\n", SanitizeTerminalOneLine(matrix.Target.Original))
 
 	tw := tabwriter.NewWriter(w, 0, 8, 3, ' ', 0)
@@ -3267,7 +3382,7 @@ func PrintTerminalMatrix(w io.Writer, matrix *MatrixResult) {
 			} else if f.Severity == SeverityWarning {
 				badge = "WARN"
 			}
-			fmt.Fprintf(w, "  [%s] %s\n", badge, SanitizeTerminalOneLine(f.Title))
+			fmt.Fprintf(w, "  %s %s\n", colorizeBadge(badge, color), SanitizeTerminalOneLine(f.Title))
 			if len(f.Evidence) > 0 {
 				fmt.Fprintf(w, "    Observed:\n")
 				for _, e := range f.Evidence {
@@ -3318,8 +3433,6 @@ func PrintTerminalDiff(w io.Writer, diff *SnapshotDiffResult) {
 	fmt.Fprintln(w)
 }
 
-// CLI dispatcher
-
 func main() {
 	code := runMain()
 	os.Exit(code)
@@ -3367,6 +3480,7 @@ func runSingleCmd(ctx context.Context, args []string) int {
 	fs.BoolVar(verbose, "v", false, "Enable verbose execution trace logs (shorthand)")
 	ipv4Only := fs.Bool("ipv4", false, "Restrict connections to IPv4")
 	ipv6Only := fs.Bool("ipv6", false, "Restrict connections to IPv6")
+	noHTTP := fs.Bool("no-http", false, "Disable HTTP probe and test TCP/TLS layers only")
 	resolver := fs.String("resolver", "", "Use custom DNS resolver IP via wire client")
 	method := fs.String("method", "HEAD", "HTTP request method (HEAD, GET, etc.)")
 	timeout := fs.Duration("timeout", 10*time.Second, "Overall timeout duration")
@@ -3405,6 +3519,7 @@ func runSingleCmd(ctx context.Context, args []string) int {
 		Target:      targetArg,
 		IPv4Only:    *ipv4Only,
 		IPv6Only:    *ipv6Only,
+		NoHTTP:      *noHTTP,
 		Resolver:    *resolver,
 		Method:      *method,
 		Timeout:     *timeout,
@@ -3504,6 +3619,7 @@ func runSnapshotCmd(ctx context.Context, args []string) int {
 
 	ipv4Only := fs.Bool("ipv4", false, "Restrict connections to IPv4")
 	ipv6Only := fs.Bool("ipv6", false, "Restrict connections to IPv6")
+	noHTTP := fs.Bool("no-http", false, "Disable HTTP probe and test TCP/TLS layers only")
 	resolver := fs.String("resolver", "", "Use custom DNS resolver IP")
 	method := fs.String("method", "HEAD", "HTTP request method")
 	timeout := fs.Duration("timeout", 10*time.Second, "Overall timeout duration")
@@ -3535,6 +3651,7 @@ func runSnapshotCmd(ctx context.Context, args []string) int {
 		Target:      targetArg,
 		IPv4Only:    *ipv4Only,
 		IPv6Only:    *ipv6Only,
+		NoHTTP:      *noHTTP,
 		Resolver:    *resolver,
 		Method:      *method,
 		Timeout:     *timeout,
@@ -3653,6 +3770,7 @@ OPTIONS:
   --json            Output JSON format
   --ipv4            Restrict to IPv4
   --ipv6            Restrict to IPv6
+  --no-http         Skip HTTP probe (test TCP and TLS layers only)
   --resolver <ip>   Use custom DNS resolver IP via wire client
   --method <name>   HTTP request method (default: HEAD)
   --timeout <dur>   Overall diagnostic timeout (default: 10s)
