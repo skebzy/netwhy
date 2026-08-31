@@ -1090,3 +1090,114 @@ func FuzzDNSNameDecoder(f *testing.F) {
 		_, _, _ = DecodeDomainName(data, offset)
 	})
 }
+
+func TestNormalizeResolverAddr(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"1.1.1.1", "1.1.1.1:53"},
+		{"1.1.1.1:5353", "1.1.1.1:5353"},
+		{"2606:4700:4700::1111", "[2606:4700:4700::1111]:53"},
+		{"[2606:4700:4700::1111]:5353", "[2606:4700:4700::1111]:5353"},
+		{"dns.google", "dns.google:53"},
+		{"dns.google:853", "dns.google:853"},
+	}
+
+	for _, tt := range tests {
+		got := normalizeResolverAddr(tt.input)
+		if got != tt.want {
+			t.Errorf("normalizeResolverAddr(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNoHTTPMode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := Run(ctx, Options{
+		Target: ts.URL,
+		NoHTTP: true,
+	})
+	if err != nil {
+		t.Fatalf("Run with NoHTTP failed: %v", err)
+	}
+	if res.HTTP != nil {
+		t.Errorf("expected HTTP probe to be nil with NoHTTP=true, got %+v", res.HTTP)
+	}
+	if res.OverallStatus != StatusPass {
+		t.Errorf("expected StatusPass, got %s", res.OverallStatus)
+	}
+}
+
+func TestImpendingCertificateExpirationWarning(t *testing.T) {
+	now := time.Now()
+	res := &RunResult{
+		OverallStatus: StatusPass,
+		Target: TargetInfo{
+			Hostname: "example.com",
+			Port:     443,
+			UseTLS:   true,
+		},
+		TLS: &TLSResult{
+			Status:        StatusPass,
+			Connected:     true,
+			ExpiryValid:   true,
+			HostnameValid: true,
+			ChainValid:    true,
+			NotBefore:     now.Add(-60 * 24 * time.Hour),
+			NotAfter:      now.Add(10 * 24 * time.Hour),
+			LeafSubject:   "CN=example.com",
+			LeafIssuer:    "Let's Encrypt",
+			ServerName:    "example.com",
+		},
+	}
+
+	findings, _, _ := ExplainWithReasoning(res)
+	var foundExpiryWarning bool
+	for _, f := range findings {
+		if f.Severity == SeverityWarning && strings.Contains(f.Title, "Expiring Soon") {
+			foundExpiryWarning = true
+			break
+		}
+	}
+	if !foundExpiryWarning {
+		t.Errorf("expected impending certificate expiry warning finding, findings: %+v", findings)
+	}
+}
+
+func TestParallelMatrixExecution(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	matrix, err := RunMatrix(ctx, MatrixOptions{
+		Target:      ts.URL,
+		Timeout:     3 * time.Second,
+		DialTimeout: 1 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunMatrix failed: %v", err)
+	}
+
+	if len(matrix.Paths) < 4 {
+		t.Fatalf("expected at least 4 paths in matrix, got %d", len(matrix.Paths))
+	}
+
+	expectedPathNames := []string{"Application path", "Direct", "IPv4 direct", "IPv6 direct"}
+	for i, name := range expectedPathNames {
+		if matrix.Paths[i].Name != name {
+			t.Errorf("matrix.Paths[%d].Name = %q, want %q", i, matrix.Paths[i].Name, name)
+		}
+	}
+}
